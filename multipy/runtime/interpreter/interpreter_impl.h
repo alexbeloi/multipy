@@ -31,8 +31,13 @@ struct InterpreterObj {
   friend struct Obj;
   friend struct ReplicatedObjImpl;
 
+ protected:
+  InterpreterSessionImpl* interaction_;
+
  public:
-  InterpreterObj() = default;
+  InterpreterObj() : interaction_(nullptr){};
+  InterpreterObj(InterpreterSessionImpl* interaction)
+      : interaction_(interaction){};
   InterpreterObj(const InterpreterObj& obj) = delete;
   InterpreterObj& operator=(const InterpreterObj& obj) = delete;
   InterpreterObj(InterpreterObj&& obj) = default;
@@ -63,13 +68,10 @@ struct Obj {
   friend struct InterpreterObj;
   explicit Obj(std::shared_ptr<InterpreterObj> baseObj)
       : baseObj_(baseObj), isDefault_(false) {}
-  Obj() : baseObj_(nullptr), interaction_(nullptr), isDefault_(true) {}
-  explicit Obj(InterpreterSessionImpl* interaction)
-      : baseObj_(nullptr), interaction_(interaction), isDefault_(false) {}
-  explicit Obj(
-    InterpreterSessionImpl* interaction,
+  Obj() : baseObj_(nullptr), isDefault_(true) {}
+  explicit Obj(InterpreterSessionImpl* interaction,
       std::shared_ptr<InterpreterObj> baseObj)
-      : baseObj_(baseObj), interaction_(interaction), isDefault_(false) {}
+      : baseObj_(baseObj), isDefault_(false) {}
 
   at::IValue toIValue() const;
   Obj operator()(at::ArrayRef<Obj> args);
@@ -80,10 +82,15 @@ struct Obj {
   Obj callKwargs(std::unordered_map<std::string, c10::IValue> kwargs);
   bool hasattr(const char* attr);
   Obj attr(const char* attr);
+  InterpreterSessionImpl* getInteraction() {
+    if (!baseObj_) {
+      return nullptr;
+    }
+    return baseObj_->interaction_;
+  }
   std::shared_ptr<InterpreterObj> baseObj_;
 
  private:
-  InterpreterSessionImpl* interaction_;
   bool isDefault_;
 };
 
@@ -125,7 +132,7 @@ struct InterpreterSessionImpl {
     return obj.isDefault_;
   }
   bool isOwner(Obj obj) const {
-    return this == obj.interaction_;
+    return this == obj.getInteraction();
   }
 };
 
@@ -141,32 +148,32 @@ struct InterpreterImpl {
 // source file that would need to exist it both the libinterpreter.so and then
 // the libtorchpy library.
 inline at::IValue Obj::toIValue() const {
-  return interaction_->toIValue(*this);
+  return baseObj_->toIValue();
 }
 
 inline Obj Obj::operator()(at::ArrayRef<Obj> args) {
-  return interaction_->call(*this, args);
+  return baseObj_->call(args);
 }
 
 inline Obj Obj::operator()(at::ArrayRef<at::IValue> args) {
-  return interaction_->call(*this, args);
+  return baseObj_->call(args);
 }
 
 inline Obj Obj::callKwargs(
     std::vector<at::IValue> args,
     std::unordered_map<std::string, c10::IValue> kwargs) {
-  return interaction_->callKwargs(*this, std::move(args), std::move(kwargs));
+  return baseObj_->callKwargs(std::move(args), std::move(kwargs));
 }
 inline Obj Obj::callKwargs(
     std::unordered_map<std::string, c10::IValue> kwargs) {
-  return interaction_->callKwargs(*this, std::move(kwargs));
+  return baseObj_->callKwargs(std::move(kwargs));
 }
 inline bool Obj::hasattr(const char* attr) {
-  return interaction_->hasattr(*this, attr);
+  return baseObj_->hasattr(attr);
 }
 
 inline Obj Obj::attr(const char* attr) {
-  return interaction_->attr(*this, attr);
+  return baseObj_->attr(attr);
 }
 
 } // namespace deploy
