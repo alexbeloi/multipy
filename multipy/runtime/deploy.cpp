@@ -9,6 +9,7 @@
 #include <multipy/runtime/Exception.h>
 #include <multipy/runtime/deploy.h>
 #include <unistd.h>
+#include <functional>
 
 #include <multipy/runtime/interpreter/Optional.hpp>
 
@@ -57,7 +58,11 @@ InterpreterManager::InterpreterManager(
   setenv("PYTORCH_DISABLE_LIBRARY", "1", /*overwrite*/ 0);
 
   for (const auto i : c10::irange(nInterp)) {
+#ifdef FBCODE_CAFFE2
     instances_.emplace_back(this, env);
+#else
+    instances_.emplace_back(env);
+#endif
     auto I = instances_.back().acquireSession();
     // make torch.version.interp be the interpreter id
     // can be used for balancing work across GPUs
@@ -103,22 +108,44 @@ Obj InterpreterSession::fromMovable(const ReplicatedObj& obj) {
 
 InterpreterSession ReplicatedObj::acquireSession(
     const Interpreter* onThisInterpreter) const {
+  MULTIPY_CHECK(
+      (pImpl_->manager_ || onThisInterpreter),
+      "ReplicatedObjImpl needs an interpreter or needs to be associated with an InterpreterManager (with ReplicatedObj::attachInterpreterManager) to create an InterpreterSession.");
   InterpreterSession I = onThisInterpreter ? onThisInterpreter->acquireSession()
                                            : pImpl_->manager_->acquireOne();
   I.self = I.fromMovable(*this);
   return I;
 }
 
+void ReplicatedObj::attachInterpreterManager(InterpreterManager* manager) {
+  MULTIPY_CHECK(
+      !pImpl_->manager_,
+      "ReplicatedObjImpl must not be associated with an interpreter manager to attach it to one.");
+  pImpl_->manager_ = manager;
+}
+
+bool InterpreterSession::attachDeconstructorCallback(
+    std::function<void(void)> func) {
+  if (deconstruction_callback_) {
+    return false;
+  }
+  deconstruction_callback_ = func;
+  return true;
+}
+
 // NOLINTNEXTLINE(bugprone-exception-escape)
 InterpreterSession::~InterpreterSession() {
-  if (manager_ && notifyIdx_ >= 0) {
-    manager_->resources_.free(notifyIdx_);
+  if (deconstruction_callback_ != NULL) {
+    deconstruction_callback_();
   }
 }
 
 void ReplicatedObjImpl::unload(const Interpreter* onThisInterpreter) {
   if (!onThisInterpreter) {
     // NOLINTNEXTLINE(clang-analyzer-core.NullDereference)
+    MULTIPY_CHECK(
+        manager_,
+        "ReplicatedObjImpl must be created from an InterpreterManager in order to unload without an interpreter");
     for (auto& interp : manager_->allInstances()) {
       unload(&interp);
     }
@@ -148,9 +175,35 @@ ReplicatedObj InterpreterSession::createMovable(Obj obj) {
       impl_->isOwner(obj),
       "Cannot create movable from an object that lives in different session");
 
+// Fully deprecate after moving over internal users to new API, currently here
+// to keep bc with old API.
+#ifdef FBCODE_CAFFE2
+  if (manager_) {
+    return manager_->createMovable(obj, this);
+  }
+#endif
+
   auto pickled = impl_->pickle(self, obj);
+  return ReplicatedObj(
+      std::make_shared<ReplicatedObjImpl>(nextObjectId_++, std::move(pickled)));
+}
+
+ReplicatedObj InterpreterManager::createMovable(
+    Obj obj,
+    InterpreterSession* I) {
+  MULTIPY_CHECK(
+      I->isOwner(obj),
+      "Cannot create movable from an object that lives in different session");
+  PickledObject pickled = I->pickleObj(obj);
   return ReplicatedObj(std::make_shared<ReplicatedObjImpl>(
-      manager_->nextObjectId_++, std::move(pickled), manager_));
+      I->nextObjectId_++, std::move(pickled), this));
+}
+
+PickledObject InterpreterSession::pickleObj(Obj obj) {
+  MULTIPY_CHECK(
+      impl_->isOwner(obj),
+      "Cannot pickle an object that lives in different session");
+  return impl_->pickle(self, obj);
 }
 
 using dlopen_t = void* (*)(const char*, int);
@@ -185,6 +238,20 @@ Interpreter::Interpreter(
           "interpreter",
           pythonInterpreterSections,
           pythonInterpreterSymbols) {
+  setUpInterpreter();
+}
+Interpreter::Interpreter(std::shared_ptr<Environment> env)
+    : handle_(nullptr),
+      manager_(nullptr),
+      env_(env),
+      interpreterFile_(
+          "interpreter",
+          pythonInterpreterSections,
+          pythonInterpreterSymbols) {
+  setUpInterpreter();
+}
+
+void Interpreter::setUpInterpreter() {
   int flags = RTLD_LOCAL | RTLD_LAZY;
   if (interpreterFile_.customLoader) {
     flags |= RTLD_DEEPBIND;
@@ -218,14 +285,14 @@ Interpreter::Interpreter(
   pluginPaths.emplace_back(torchPluginFile_->libraryName);
 #endif
 
-  auto extraPythonPaths = env->getExtraPythonPaths();
+  auto extraPythonPaths = env_->getExtraPythonPaths();
   void* newInterpreterImpl = dlsym(handle_, "newInterpreterImpl");
   AT_ASSERT(newInterpreterImpl);
   pImpl_ = std::unique_ptr<InterpreterImpl>(
       ((InterpreterImpl *
         (*)(const std::vector<std::string>&, const std::vector<std::string>&))
            newInterpreterImpl)(extraPythonPaths, pluginPaths));
-  env->configureInterpreter(this);
+  env_->configureInterpreter(this);
 }
 
 Interpreter::~Interpreter() {
